@@ -51,6 +51,14 @@ var (
 	}
 )
 
+func RegisterStructType(valueType string, t reflect.Type) error {
+	if _, ok := typesMap[valueType]; ok {
+		return nil
+	}
+	typesMap[valueType] = t
+	return nil
+}
+
 // ErrUnsupportedType ...
 type ErrUnsupportedType struct {
 	valueType string
@@ -137,6 +145,19 @@ func reflectValue(valueType string, value interface{}) (reflect.Value, error) {
 
 		theValue.Elem().SetString(stringValue)
 		return theValue.Elem(), nil
+	}
+
+	// Structs
+	if theType.Kind() == reflect.Struct {
+		return getStructValue(theType.String(), value, theType)
+		// obj := reflect.New(theType).Interface()
+		//
+		// if objBytes, err := json.Marshal(value); err != nil {
+		// 	return reflect.Value{}, err
+		// } else if err := json.Unmarshal(objBytes, &obj); err != nil {
+		// 	return reflect.Value{}, err
+		// }
+		// return reflect.Indirect(reflect.ValueOf(obj)), nil
 	}
 
 	return reflect.Value{}, NewErrUnsupportedType(valueType)
@@ -254,7 +275,31 @@ func reflectValues(valueType string, value interface{}) (reflect.Value, error) {
 		return theValue, nil
 	}
 
-	return reflect.Value{}, NewErrUnsupportedType(valueType)
+	// Structs
+	vals := reflect.ValueOf(value)
+	theValue = reflect.MakeSlice(theType, vals.Len(), vals.Len())
+	for i := 0; i < vals.Len(); i++ {
+		elemType := theType.Elem()
+		val, err := getStructValue(strings.Split(theType.String(), "[]")[1], vals.Index(i).Interface(), elemType)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+
+		theValue.Index(i).Set(val)
+	}
+	return theValue, nil
+
+	// return reflect.Value{}, NewErrUnsupportedType(valueType)
+}
+
+func getStructValue(theType string, value interface{}, structType reflect.Type) (reflect.Value, error) {
+	obj := reflect.New(structType).Interface()
+	if objBytes, err := json.Marshal(value); err != nil {
+		return reflect.Value{}, err
+	} else if err := json.Unmarshal(objBytes, &obj); err != nil {
+		return reflect.Value{}, err
+	}
+	return reflect.Indirect(reflect.ValueOf(obj)), nil
 }
 
 func getBoolValue(theType string, value interface{}) (bool, error) {

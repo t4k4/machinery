@@ -11,6 +11,11 @@ import (
 	"github.com/RichardKnop/machinery/v1/tasks"
 )
 
+type registeredStructNames struct {
+	sync.RWMutex
+	items []string
+}
+
 type registeredTaskNames struct {
 	sync.RWMutex
 	items []string
@@ -18,12 +23,13 @@ type registeredTaskNames struct {
 
 // Broker represents a base broker structure
 type Broker struct {
-	cnf                 *config.Config
-	registeredTaskNames registeredTaskNames
-	retry               bool
-	retryFunc           func(chan int)
-	retryStopChan       chan int
-	stopChan            chan int
+	cnf                   *config.Config
+	registeredTaskNames   registeredTaskNames
+	registeredStructNames registeredStructNames
+	retry                 bool
+	retryFunc             func(chan int)
+	retryStopChan         chan int
+	stopChan              chan int
 }
 
 // NewBroker creates new Broker instance
@@ -73,12 +79,29 @@ func (b *Broker) SetRegisteredTaskNames(names []string) {
 	b.registeredTaskNames.items = names
 }
 
+func (b *Broker) SetRegisteredStructNames(names []string) {
+	b.registeredStructNames.Lock()
+	defer b.registeredStructNames.Unlock()
+	b.registeredStructNames.items = names
+}
+
 // IsTaskRegistered returns true if the task is registered with this broker
 func (b *Broker) IsTaskRegistered(name string) bool {
 	b.registeredTaskNames.RLock()
 	defer b.registeredTaskNames.RUnlock()
 	for _, registeredTaskName := range b.registeredTaskNames.items {
 		if registeredTaskName == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Broker) IsStructRegistered(name string) bool {
+	b.registeredStructNames.RLock()
+	defer b.registeredStructNames.RUnlock()
+	for _, registeredStructName := range b.registeredStructNames.items {
+		if registeredStructName == name {
 			return true
 		}
 	}
@@ -123,6 +146,13 @@ func (b *Broker) GetRegisteredTaskNames() []string {
 	b.registeredTaskNames.RLock()
 	defer b.registeredTaskNames.RUnlock()
 	items := b.registeredTaskNames.items
+	return items
+}
+
+func (b *Broker) GetRegisteredStructNames() []string {
+	b.registeredStructNames.RLock()
+	defer b.registeredStructNames.RUnlock()
+	items := b.registeredStructNames.items
 	return items
 }
 

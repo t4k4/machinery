@@ -11,6 +11,7 @@ import (
 type Broker interface {
 	GetConfig() *config.Config
 	SetRegisteredTaskNames(names []string)
+	SetRegisteredStructNames(names []string)
 	IsTaskRegistered(name string) bool
 	StartConsuming(consumerTag string, concurrency int, p TaskProcessor) (bool, error)
 	StopConsuming()

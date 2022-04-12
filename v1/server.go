@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 type Server struct {
 	config            *config.Config
 	registeredTasks   *sync.Map
+	registeredStructs *sync.Map
 	broker            brokersiface.Broker
 	backend           backendsiface.Backend
 	lock              lockiface.Lock
@@ -39,12 +41,13 @@ type Server struct {
 // NewServerWithBrokerBackend ...
 func NewServerWithBrokerBackendLock(cnf *config.Config, brokerServer brokersiface.Broker, backendServer backendsiface.Backend, lock lockiface.Lock) *Server {
 	srv := &Server{
-		config:          cnf,
-		registeredTasks: new(sync.Map),
-		broker:          brokerServer,
-		backend:         backendServer,
-		lock:            lock,
-		scheduler:       cron.New(),
+		config:            cnf,
+		registeredTasks:   new(sync.Map),
+		registeredStructs: new(sync.Map),
+		broker:            brokerServer,
+		backend:           backendServer,
+		lock:              lock,
+		scheduler:         cron.New(),
 	}
 
 	// Run scheduler job
@@ -136,6 +139,29 @@ func (server *Server) SetPreTaskHandler(handler func(*tasks.Signature)) {
 	server.prePublishHandler = handler
 }
 
+func (server *Server) parseFunc(f interface{}) error {
+	ft := reflect.TypeOf(f)
+	m := map[string]reflect.Type{}
+
+	for i := 0; i < ft.NumIn(); i++ {
+		in := ft.In(i)
+		structName := in.String()
+		if !server.IsStructRegistered(structName) {
+			m[structName] = in
+		}
+	}
+
+	for i := 0; i < ft.NumOut(); i++ {
+		out := ft.Out(i)
+		structName := out.String()
+		if !server.IsStructRegistered(structName) {
+			m[structName] = out
+		}
+	}
+
+	return server.RegisterStructs(m)
+}
+
 // RegisterTasks registers all tasks at once
 func (server *Server) RegisterTasks(namedTaskFuncs map[string]interface{}) error {
 	for _, task := range namedTaskFuncs {
@@ -145,10 +171,25 @@ func (server *Server) RegisterTasks(namedTaskFuncs map[string]interface{}) error
 	}
 
 	for k, v := range namedTaskFuncs {
+		if err := server.parseFunc(v); err != nil {
+			return err
+		}
 		server.registeredTasks.Store(k, v)
 	}
 
 	server.broker.SetRegisteredTaskNames(server.GetRegisteredTaskNames())
+	return nil
+}
+
+func (server *Server) RegisterStructs(namedStructTypes map[string]reflect.Type) error {
+	// TODO: validate
+	for k, v := range namedStructTypes {
+		if err := tasks.RegisterStructType(k, v); err != nil {
+			return err
+		}
+		server.registeredStructs.Store(k, v)
+	}
+	server.broker.SetRegisteredStructNames(server.GetRegisteredStructNames())
 	return nil
 }
 
@@ -157,14 +198,34 @@ func (server *Server) RegisterTask(name string, taskFunc interface{}) error {
 	if err := tasks.ValidateTask(taskFunc); err != nil {
 		return err
 	}
+	if err := server.parseFunc(taskFunc); err != nil {
+		return err
+	}
 	server.registeredTasks.Store(name, taskFunc)
 	server.broker.SetRegisteredTaskNames(server.GetRegisteredTaskNames())
+	return nil
+}
+
+// RegisterStruct
+func (server *Server) RegisterStruct(name string, structType reflect.Type) error {
+	// TODO: validate
+	if err := tasks.RegisterStructType(name, structType); err != nil {
+		return err
+	}
+	server.registeredStructs.Store(name, structType)
+	server.broker.SetRegisteredStructNames(server.GetRegisteredStructNames())
 	return nil
 }
 
 // IsTaskRegistered returns true if the task name is registered with this broker
 func (server *Server) IsTaskRegistered(name string) bool {
 	_, ok := server.registeredTasks.Load(name)
+	return ok
+}
+
+// IsStructRegistered returns true if the struct name is registered with this broker
+func (server *Server) IsStructRegistered(name string) bool {
+	_, ok := server.registeredStructs.Load(name)
 	return ok
 }
 
@@ -175,6 +236,15 @@ func (server *Server) GetRegisteredTask(name string) (interface{}, error) {
 		return nil, fmt.Errorf("Task not registered error: %s", name)
 	}
 	return taskFunc, nil
+}
+
+// GetRegisteredStruct returns registered struct by name
+func (server *Server) GetRegisteredStruct(name string) (reflect.Type, error) {
+	structType, ok := server.registeredStructs.Load(name)
+	if !ok {
+		return nil, fmt.Errorf("Struct not registered error: %s", name)
+	}
+	return structType.(reflect.Type), nil
 }
 
 // SendTaskWithContext will inject the trace context in the signature headers before publishing it
@@ -353,22 +423,33 @@ func (server *Server) GetRegisteredTaskNames() []string {
 	return taskNames
 }
 
+// GetRegisteredStructNames returns slice of registered struct names
+func (server *Server) GetRegisteredStructNames() []string {
+	structNames := make([]string, 0)
+
+	server.registeredStructs.Range(func(key, value interface{}) bool {
+		structNames = append(structNames, key.(string))
+		return true
+	})
+	return structNames
+}
+
 // RegisterPeriodicTask register a periodic task which will be triggered periodically
 func (server *Server) RegisterPeriodicTask(spec, name string, signature *tasks.Signature) error {
-	//check spec
+	// check spec
 	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
 		return err
 	}
 
 	f := func() {
-		//get lock
+		// get lock
 		err := server.lock.LockWithRetries(utils.GetLockName(name, spec), schedule.Next(time.Now()).UnixNano()-1)
 		if err != nil {
 			return
 		}
 
-		//send task
+		// send task
 		_, err = server.SendTask(tasks.CopySignature(signature))
 		if err != nil {
 			log.ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
@@ -381,7 +462,7 @@ func (server *Server) RegisterPeriodicTask(spec, name string, signature *tasks.S
 
 // RegisterPeriodicChain register a periodic chain which will be triggered periodically
 func (server *Server) RegisterPeriodicChain(spec, name string, signatures ...*tasks.Signature) error {
-	//check spec
+	// check spec
 	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
 		return err
@@ -391,13 +472,13 @@ func (server *Server) RegisterPeriodicChain(spec, name string, signatures ...*ta
 		// new chain
 		chain, _ := tasks.NewChain(tasks.CopySignatures(signatures...)...)
 
-		//get lock
+		// get lock
 		err := server.lock.LockWithRetries(utils.GetLockName(name, spec), schedule.Next(time.Now()).UnixNano()-1)
 		if err != nil {
 			return
 		}
 
-		//send task
+		// send task
 		_, err = server.SendChain(chain)
 		if err != nil {
 			log.ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
@@ -410,7 +491,7 @@ func (server *Server) RegisterPeriodicChain(spec, name string, signatures ...*ta
 
 // RegisterPeriodicGroup register a periodic group which will be triggered periodically
 func (server *Server) RegisterPeriodicGroup(spec, name string, sendConcurrency int, signatures ...*tasks.Signature) error {
-	//check spec
+	// check spec
 	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
 		return err
@@ -420,13 +501,13 @@ func (server *Server) RegisterPeriodicGroup(spec, name string, sendConcurrency i
 		// new group
 		group, _ := tasks.NewGroup(tasks.CopySignatures(signatures...)...)
 
-		//get lock
+		// get lock
 		err := server.lock.LockWithRetries(utils.GetLockName(name, spec), schedule.Next(time.Now()).UnixNano()-1)
 		if err != nil {
 			return
 		}
 
-		//send task
+		// send task
 		_, err = server.SendGroup(group, sendConcurrency)
 		if err != nil {
 			log.ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
@@ -439,7 +520,7 @@ func (server *Server) RegisterPeriodicGroup(spec, name string, sendConcurrency i
 
 // RegisterPeriodicChord register a periodic chord which will be triggered periodically
 func (server *Server) RegisterPeriodicChord(spec, name string, sendConcurrency int, callback *tasks.Signature, signatures ...*tasks.Signature) error {
-	//check spec
+	// check spec
 	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
 		return err
@@ -450,13 +531,13 @@ func (server *Server) RegisterPeriodicChord(spec, name string, sendConcurrency i
 		group, _ := tasks.NewGroup(tasks.CopySignatures(signatures...)...)
 		chord, _ := tasks.NewChord(group, tasks.CopySignature(callback))
 
-		//get lock
+		// get lock
 		err := server.lock.LockWithRetries(utils.GetLockName(name, spec), schedule.Next(time.Now()).UnixNano()-1)
 		if err != nil {
 			return
 		}
 
-		//send task
+		// send task
 		_, err = server.SendChord(chord, sendConcurrency)
 		if err != nil {
 			log.ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
